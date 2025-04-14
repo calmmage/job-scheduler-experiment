@@ -3,22 +3,23 @@ import os
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import uvicorn
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Depends, FastAPI, HTTPException
 from loguru import logger
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 from pymongo.server_api import ServerApi
+from pymongo.database import Database
+
+from .scheduler_app import SchedulerApp
 
 # --- Global State ---
 # Using a dictionary for simple state management during lifespan
@@ -27,41 +28,25 @@ app_state: Dict[str, Any] = {}
 
 # --- FastAPI Models ---
 class AddJobRequest(BaseModel):
-    path_to_executable: str
-    path_to_env: str
-    schedule_interval_seconds: Optional[int] = None
-    cron_schedule: Optional[str] = None
-    job_key: str
-    python_executable_path: Optional[str] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_schedule_provided(cls, values):
-        interval = values.get("schedule_interval_seconds")
-        cron = values.get("cron_schedule")
-        if (interval is None and cron is None) or (
-            interval is not None and cron is not None
-        ):
-            raise ValueError(
-                "Exactly one of 'schedule_interval_seconds' or 'cron_schedule' must be provided."
-            )
-        if interval is not None and interval <= 0:
-            raise ValueError("'schedule_interval_seconds' must be positive.")
-        return values
+    job_id: str
+    interval: int
+    message: str
 
 
 class AddJobResponse(BaseModel):
     message: str
-    job_key: str
+    job_id: str
 
 
 class JobStatus(BaseModel):
-    job_key: str
-    last_run: Optional[datetime]
-    next_run: Optional[datetime] = None
-    status: str
-    retry_count: int = 0
-    error_message: Optional[str]
+    job_id: str
+    name: str
+    command: str
+    schedule: str
+    last_run: Optional[str] = None
+    next_run: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
+    status: str = "pending"
 
 
 class JobListResponse(BaseModel):
@@ -70,66 +55,18 @@ class JobListResponse(BaseModel):
 
 class DeleteJobResponse(BaseModel):
     message: str
-    deleted_job_key: str
+    deleted_job_id: str
 
 
 # --- End FastAPI Models ---
 
 
 class JobConfig(BaseModel):
-    path_to_executable: Path
-    path_to_env: Path
-    last_run_timestamp: Optional[datetime] = None
-    schedule_interval_seconds: Optional[int] = None
-    cron_schedule: Optional[str] = None
-    job_key: str = Field(...)
-    python_executable_path: Optional[Path] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_schedule_stored(cls, values):
-        interval = values.get("schedule_interval_seconds")
-        cron = values.get("cron_schedule")
-        if interval is None and cron is None:
-            raise ValueError(
-                "Internal error: JobConfig loaded without a schedule type."
-            )
-        if interval is not None and cron is not None:
-            raise ValueError(
-                "Internal error: JobConfig loaded with both schedule types."
-            )
-        return values
-
-    @field_validator("path_to_executable")
-    def executable_must_exist(cls, v):
-        if not v.exists() or not v.is_file():
-            raise ValueError(f"Executable path does not exist or is not a file: {v}")
-        if v.suffix != ".py":
-            logger.warning(
-                f"Executable {v} is not a .py file. Ensure it is executable."
-            )
-        return v
-
-    @field_validator("path_to_env")
-    def env_must_exist(cls, v):
-        if not v.exists() or not v.is_file():
-            raise ValueError(
-                f"Environment file path does not exist or is not a file: {v}"
-            )
-        return v
-
-    @field_validator("python_executable_path")
-    def python_executable_must_exist(cls, v):
-        if v is not None:
-            if not v.exists() or not v.is_file():
-                raise ValueError(
-                    f"Specified Python executable path does not exist or is not a file: {v}"
-                )
-            if "python" not in v.name.lower():
-                logger.warning(
-                    f"Specified python executable path {v} doesn't obviously look like a Python executable."
-                )
-        return v
+    job_id: str
+    name: str
+    command: str
+    schedule: str
+    telegram_chat_id: Optional[str] = None
 
 
 class Settings(BaseSettings):
@@ -139,6 +76,7 @@ class Settings(BaseSettings):
     mongodb_db_name: str = Field(..., alias="MONGODB_DB_NAME")
     telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = Field(..., alias="TELEGRAM_CHAT_ID")
+    mongodb_server_api: str = "1"
 
 
 # --- Initialization Functions ---
@@ -184,12 +122,12 @@ async def notify_telegram(bot: Bot, chat_id: str, message: str):
 # --- Job Execution Logic ---
 
 
-async def run_job_wrapper(job_key: str):
+async def run_job_wrapper(job_id: str):
     """
     Wrapper function called by APScheduler.
     It retrieves necessary dependencies from app_state and calls the actual run_job.
     """
-    logger.debug(f"Scheduler triggered run_job_wrapper for job_key: {job_key}")
+    logger.debug(f"Scheduler triggered run_job_wrapper for job_id: {job_id}")
     # Retrieve dependencies from global state
     jobs_collection = app_state.get("jobs_collection")
     logs_collection = app_state.get("logs_collection")
@@ -203,22 +141,20 @@ async def run_job_wrapper(job_key: str):
 
     try:
         # Fetch job config from DB
-        job_doc = await asyncio.to_thread(
-            jobs_collection.find_one, {"job_key": job_key}
-        )
+        job_doc = await asyncio.to_thread(jobs_collection.find_one, {"job_id": job_id})
         if not job_doc:
             logger.error(
-                f"Job {job_key} not found in database for execution. Cancelling scheduled task."
+                f"Job {job_id} not found in database for execution. Cancelling scheduled task."
             )
             # Try to cancel the orphaned job in the scheduler
             scheduler: AsyncIOScheduler = app_state.get("scheduler")
             if scheduler:
                 try:
-                    scheduler.remove_job(job_key)
-                    logger.info(f"Cancelled orphaned job {job_key} in APScheduler.")
+                    scheduler.remove_job(job_id)
+                    logger.info(f"Cancelled orphaned job {job_id} in APScheduler.")
                 except Exception as cancel_err:
                     logger.error(
-                        f"Failed to cancel orphaned job {job_key} in APScheduler: {cancel_err}"
+                        f"Failed to cancel orphaned job {job_id} in APScheduler: {cancel_err}"
                     )
             return
 
@@ -232,13 +168,13 @@ async def run_job_wrapper(job_key: str):
 
     except Exception as e:
         logger.error(
-            f"Error during run_job_wrapper for {job_key}: {e}\n{traceback.format_exc()}"
+            f"Error during run_job_wrapper for {job_id}: {e}\n{traceback.format_exc()}"
         )
         # Attempt to notify about wrapper failure
         await notify_telegram(
             bot,
             settings.telegram_chat_id,
-            f"Scheduler wrapper failed for job {job_key}: {e}",
+            f"Scheduler wrapper failed for job {job_id}: {e}",
         )
 
 
@@ -251,7 +187,7 @@ async def execute_job_script(
     """
     start_time = datetime.now(timezone.utc)
     log_entry = {
-        "job_key": job.job_key,
+        "job_id": job.job_id,
         "timestamp": start_time,
         "status": "running",
         "stdout": "",
@@ -264,54 +200,28 @@ async def execute_job_script(
         log_id = log_result.inserted_id
     except Exception as log_insert_err:
         logger.error(
-            f"Failed to insert initial 'running' log for {job.job_key}: {log_insert_err}"
+            f"Failed to insert initial 'running' log for {job.job_id}: {log_insert_err}"
         )
         # Attempt to notify and then exit - can't proceed without log entry
         await notify_telegram(
-            bot, settings.telegram_chat_id, f"Failed to log start for job {job.job_key}"
+            bot, settings.telegram_chat_id, f"Failed to log start for job {job.job_id}"
         )
         return
 
     try:
-        logger.info(f"Executing job script: {job.job_key} ({job.path_to_executable})")
+        logger.info(f"Executing job script: {job.job_id} ({job.command})")
 
         # Prepare environment variables
         job_env = os.environ.copy()
-        if job.path_to_env.exists():
-            with open(job.path_to_env) as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        key, value = line.split("=", 1)
-                        job_env[key.strip()] = value.strip()
-
-        # Determine the Python executable
-        if job.python_executable_path and job.python_executable_path.exists():
-            python_executable = job.python_executable_path
-            logger.info(f"Using job-specific python executable: {python_executable}")
-        else:
-            stable_venv_path_str = os.environ.get("STABLE_VENV_PATH")
-            if not stable_venv_path_str:
-                raise OSError(
-                    "STABLE_VENV_PATH env var not set and no valid job-specific python exec provided."
-                )
-            python_executable = Path(stable_venv_path_str) / "bin/python3"
-            logger.info(
-                f"Using STABLE_VENV_PATH python executable: {python_executable}"
-            )
-            if not python_executable.is_file():
-                raise FileNotFoundError(
-                    f"Python executable not found or is not a file: {python_executable}"
-                )
+        if job.telegram_chat_id:
+            job_env["TELEGRAM_CHAT_ID"] = job.telegram_chat_id
 
         # Execute the script
         process = await asyncio.create_subprocess_exec(
-            str(python_executable),
-            str(job.path_to_executable),
+            job.command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=job_env,
-            cwd=job.path_to_executable.parent,
         )
         stdout, stderr = await process.communicate()
         stdout_str = stdout.decode(errors="ignore").strip() if stdout else ""
@@ -322,12 +232,12 @@ async def execute_job_script(
         # Determine outcome
         if process.returncode == 0:
             status = "success"
-            logger.info(f"Job {job.job_key} completed successfully in {duration:.2f}s.")
+            logger.info(f"Job {job.job_id} completed successfully in {duration:.2f}s.")
         else:
             status = "failure"
-            error_message_short = f"Job '{job.job_key}' failed! RC: {process.returncode}, Stderr: {stderr_str[:500]}"
+            error_message_short = f"Job '{job.job_id}' failed! RC: {process.returncode}, Stderr: {stderr_str[:500]}"
             logger.error(
-                f"Job {job.job_key} failed. RC: {process.returncode}, Duration: {duration:.2f}s."
+                f"Job {job.job_id} failed. RC: {process.returncode}, Duration: {duration:.2f}s."
             )
             logger.error(f"Stderr: {stderr_str}")
             await notify_telegram(bot, settings.telegram_chat_id, error_message_short)
@@ -348,14 +258,14 @@ async def execute_job_script(
         # Update last run timestamp in jobs collection
         await asyncio.to_thread(
             jobs_collection.update_one,
-            {"job_key": job.job_key},
+            {"job_id": job.job_id},
             {"$set": {"last_run_timestamp": start_time}},
         )
 
     except (FileNotFoundError, OSError) as env_err:  # Catch env/path setup errors
         end_time = datetime.now(timezone.utc)
         status = "failure"
-        error_message = f"Job {job.job_key} setup failed: {env_err}"
+        error_message = f"Job {job.job_id} setup failed: {env_err}"
         logger.error(error_message)
         await notify_telegram(bot, settings.telegram_chat_id, error_message)
         await asyncio.to_thread(
@@ -373,11 +283,11 @@ async def execute_job_script(
         end_time = datetime.now(timezone.utc)
         status = "failure"
         error_message = (
-            f"Job {job.job_key} execution crashed: {exec_err}\n{traceback.format_exc()}"
+            f"Job {job.job_id} execution crashed: {exec_err}\n{traceback.format_exc()}"
         )
         logger.error(error_message)
         await notify_telegram(
-            bot, settings.telegram_chat_id, f"Job '{job.job_key}' crashed! See logs."
+            bot, settings.telegram_chat_id, f"Job '{job.job_id}' crashed! See logs."
         )
         await asyncio.to_thread(
             logs_collection.update_one,
@@ -414,10 +324,10 @@ async def lifespan(app: FastAPI):
 
         # Ensure MongoDB indexes
         logger.info("Ensuring MongoDB indexes...")
-        await asyncio.to_thread(db.jobs.create_index, "job_key", unique=True)
+        await asyncio.to_thread(db.jobs.create_index, "job_id", unique=True)
         await asyncio.to_thread(db.jobs.create_index, "last_run_timestamp")
         await asyncio.to_thread(db.job_logs.create_index, "timestamp")
-        await asyncio.to_thread(db.job_logs.create_index, "job_key")
+        await asyncio.to_thread(db.job_logs.create_index, "job_id")
         await asyncio.to_thread(db.job_logs.create_index, "status")
         logger.info("MongoDB indexes ensured.")
 
@@ -433,29 +343,20 @@ async def lifespan(app: FastAPI):
 
         scheduled_count = 0
         for job_doc in existing_jobs:
-            job_key = job_doc["job_key"]
+            job_id = job_doc["job_id"]
             try:
-                if job_doc.get("schedule_interval_seconds"):
-                    scheduler.add_job(
-                        run_job_wrapper,
-                        IntervalTrigger(seconds=job_doc["schedule_interval_seconds"]),
-                        args=[job_key],
-                        id=job_key,
-                        replace_existing=True,
-                    )
-                elif job_doc.get("cron_schedule"):
-                    scheduler.add_job(
-                        run_job_wrapper,
-                        CronTrigger.from_crontab(job_doc["cron_schedule"]),
-                        args=[job_key],
-                        id=job_key,
-                        replace_existing=True,
-                    )
-                logger.info(f"Scheduled existing job: {job_key}")
+                scheduler.add_job(
+                    run_job_wrapper,
+                    IntervalTrigger(seconds=int(job_doc["schedule"])),
+                    args=[job_id],
+                    id=job_id,
+                    replace_existing=True,
+                )
+                logger.info(f"Scheduled existing job: {job_id}")
                 scheduled_count += 1
             except Exception as schedule_err:
                 logger.error(
-                    f"Failed to schedule existing job {job_key}: {schedule_err}"
+                    f"Failed to schedule existing job {job_id}: {schedule_err}"
                 )
 
         logger.info(
@@ -532,15 +433,25 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App and Endpoints ---
 
+
+class AppState:
+    def __init__(self):
+        self.scheduler: AsyncIOScheduler = AsyncIOScheduler()
+        self.scheduler_app: Optional[SchedulerApp] = None
+        self.bot: Optional[Bot] = None
+        self.db: Optional[Database] = None
+
+
 app = FastAPI(lifespan=lifespan)
+app.state = AppState()
 
 
 # Dependency to get scheduler instance
 async def get_scheduler() -> AsyncIOScheduler:
-    scheduler = app_state.get("scheduler")
-    if not scheduler:
-        raise HTTPException(status_code=503, detail="Scheduler not available.")
-    return scheduler
+    scheduler = app.state.scheduler
+    if scheduler is None:
+        raise RuntimeError("Scheduler not initialized")
+    return cast(AsyncIOScheduler, scheduler)
 
 
 # Dependency to get settings
@@ -567,7 +478,7 @@ def get_logs_collection():
     return collection
 
 
-@app.post("/add_job", response_model=AddJobResponse)
+@app.post("/jobs", response_model=AddJobResponse)
 async def add_job_endpoint(
     job_request: AddJobRequest,
     scheduler: AsyncIOScheduler = Depends(get_scheduler),
@@ -575,50 +486,47 @@ async def add_job_endpoint(
     settings: Settings = Depends(get_settings),
 ):
     """Adds a job to the database and schedules it."""
-    job_key = job_request.job_key
-    logger.info(f"Received request to add job: {job_key}")
+    job_id = job_request.job_id
+    logger.info(f"Received request to add job: {job_id}")
 
     # Check if job already exists in scheduler
-    if scheduler.get_job(job_key):
-        logger.warning(f"Job key '{job_key}' already exists in the scheduler.")
+    if scheduler.get_job(job_id):
+        logger.warning(f"Job id '{job_id}' already exists in the scheduler.")
         raise HTTPException(
-            status_code=409, detail=f"Job with key '{job_key}' is already scheduled."
+            status_code=409, detail=f"Job with id '{job_id}' is already scheduled."
         )
 
     try:
         # --- Database Operation ---
         # Convert paths and validate JobConfig
         job_data = job_request.model_dump()
-        job_data["path_to_executable"] = Path(job_data["path_to_executable"]).resolve()
-        job_data["path_to_env"] = Path(job_data["path_to_env"]).resolve()
-        if job_data.get("python_executable_path"):
-            job_data["python_executable_path"] = Path(
-                job_data["python_executable_path"]
-            ).resolve()
+        job_data["command"] = job_data["command"]
+        job_data["schedule"] = job_data["schedule"]
+        job_data["telegram_chat_id"] = job_data.get("telegram_chat_id")
 
         # Validate model instance (Pydantic)
         job_config = JobConfig(**job_data)
 
         # Prepare doc for MongoDB
         job_doc = job_config.model_dump(mode="json")
-        job_doc["path_to_executable"] = str(job_doc["path_to_executable"])
-        job_doc["path_to_env"] = str(job_doc["path_to_env"])
-        if job_doc.get("python_executable_path"):
-            job_doc["python_executable_path"] = str(job_doc["python_executable_path"])
+        job_doc["command"] = job_doc["command"]
+        job_doc["schedule"] = job_doc["schedule"]
+        if job_doc.get("telegram_chat_id"):
+            job_doc["telegram_chat_id"] = job_doc["telegram_chat_id"]
 
         # Insert into MongoDB
         try:
             await asyncio.to_thread(jobs_collection.insert_one, job_doc)
-            logger.info(f"Successfully added job config to DB: {job_key}")
+            logger.info(f"Successfully added job config to DB: {job_id}")
         except Exception as e:
             if "E11000 duplicate key error collection" in str(e):
-                logger.warning(f"Attempted to add duplicate job_key to DB: {job_key}")
+                logger.warning(f"Attempted to add duplicate job_id to DB: {job_id}")
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Job config with key '{job_key}' already exists in DB.",
+                    detail=f"Job config with id '{job_id}' already exists in DB.",
                 )
             else:
-                logger.error(f"Failed to insert job {job_key} into MongoDB: {e}")
+                logger.error(f"Failed to insert job {job_id} into MongoDB: {e}")
                 raise HTTPException(
                     status_code=500,
                     detail=f"Database error when adding job config: {e}",
@@ -626,55 +534,44 @@ async def add_job_endpoint(
 
         # --- Scheduling Operation ---
         try:
-            if job_request.schedule_interval_seconds:
-                scheduler.add_job(
-                    run_job_wrapper,
-                    IntervalTrigger(seconds=job_request.schedule_interval_seconds),
-                    args=[job_key],
-                    id=job_key,
-                    replace_existing=True,
-                )
-            elif job_request.cron_schedule:
-                scheduler.add_job(
-                    run_job_wrapper,
-                    CronTrigger.from_crontab(job_request.cron_schedule),
-                    args=[job_key],
-                    id=job_key,
-                    replace_existing=True,
-                )
-            logger.info(f"Successfully scheduled job: {job_key}")
+            scheduler.add_job(
+                run_job_wrapper,
+                IntervalTrigger(seconds=int(job_config.schedule)),
+                args=[job_id],
+                id=job_id,
+                replace_existing=True,
+            )
+            logger.info(f"Successfully scheduled job: {job_id}")
             return AddJobResponse(
-                message="Job added and scheduled successfully", job_key=job_key
+                message="Job added and scheduled successfully", job_id=job_id
             )
 
         except Exception as schedule_err:
             logger.error(
-                f"Failed to schedule job {job_key} after DB insert: {schedule_err}"
+                f"Failed to schedule job {job_id} after DB insert: {schedule_err}"
             )
             # Attempt to clean up the DB entry if scheduling fails
             try:
-                await asyncio.to_thread(
-                    jobs_collection.delete_one, {"job_key": job_key}
-                )
+                await asyncio.to_thread(jobs_collection.delete_one, {"job_id": job_id})
                 logger.warning(
-                    f"Removed DB entry for {job_key} due to scheduling failure."
+                    f"Removed DB entry for {job_id} due to scheduling failure."
                 )
             except Exception as cleanup_err:
                 logger.error(
-                    f"Failed to cleanup DB entry for {job_key} after scheduling error: {cleanup_err}"
+                    f"Failed to cleanup DB entry for {job_id} after scheduling error: {cleanup_err}"
                 )
             raise HTTPException(
                 status_code=500, detail=f"Failed to schedule job: {schedule_err}"
             )
 
     except ValueError as e:  # Catches Pydantic validation errors
-        logger.error(f"Validation error adding job {job_key}: {e}")
+        logger.error(f"Validation error adding job {job_id}: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:  # Re-raise HTTP exceptions
         raise
     except Exception as e:
         logger.error(
-            f"Unexpected error in add_job_endpoint for {job_key}: {e}\n{traceback.format_exc()}"
+            f"Unexpected error in add_job_endpoint for {job_id}: {e}\n{traceback.format_exc()}"
         )
         raise HTTPException(
             status_code=500, detail="An unexpected server error occurred."
@@ -696,12 +593,12 @@ async def list_jobs(
         logger.debug(f"Found {len(job_configs)} job configs in DB.")
 
         for job_doc in job_configs:
-            job_key = job_doc["job_key"]
+            job_id = job_doc["job_id"]
             last_run_ts = job_doc.get("last_run_timestamp")
 
             # Find the most recent log entry for status
             latest_log = await asyncio.to_thread(
-                logs_collection.find_one, {"job_key": job_key}, sort=[("timestamp", -1)]
+                logs_collection.find_one, {"job_id": job_id}, sort=[("timestamp", -1)]
             )
 
             status = "pending"
@@ -717,12 +614,14 @@ async def list_jobs(
 
             # next_run is set to None as we don't calculate prediction here
             job_status = JobStatus(
-                job_key=job_key,
+                job_id=job_id,
+                name=job_doc.get("name", ""),
+                command=job_doc.get("command", ""),
+                schedule=job_doc.get("schedule", ""),
                 last_run=last_run_ts,
                 next_run=None,  # Not calculated here
+                telegram_chat_id=job_doc.get("telegram_chat_id"),
                 status=status,
-                retry_count=0,  # Still placeholder
-                error_message=error_message,
             )
             jobs.append(job_status)
 
@@ -733,23 +632,19 @@ async def list_jobs(
         raise HTTPException(status_code=500, detail="Error retrieving job list.")
 
 
-@app.get("/jobs/{job_key}", response_model=JobStatus)
+@app.get("/jobs/{job_id}", response_model=JobStatus)
 async def get_job_status(
-    job_key: str,
+    job_id: str,
     jobs_collection=Depends(get_jobs_collection),
     logs_collection=Depends(get_logs_collection),
 ):
     """Gets status of a specific job based on DB entry and latest log."""
-    logger.debug(f"Request received for status of job: {job_key}")
+    logger.debug(f"Request received for status of job: {job_id}")
     try:
         # Get job config from DB
-        job_doc = await asyncio.to_thread(
-            jobs_collection.find_one, {"job_key": job_key}
-        )
+        job_doc = await asyncio.to_thread(jobs_collection.find_one, {"job_id": job_id})
         if not job_doc:
-            logger.warning(
-                f"Job key '{job_key}' not found in database for status check."
-            )
+            logger.warning(f"Job id '{job_id}' not found in database for status check.")
             raise HTTPException(
                 status_code=404, detail="Job config not found in database"
             )
@@ -758,7 +653,7 @@ async def get_job_status(
 
         # Find the most recent log entry
         latest_log = await asyncio.to_thread(
-            logs_collection.find_one, {"job_key": job_key}, sort=[("timestamp", -1)]
+            logs_collection.find_one, {"job_id": job_id}, sort=[("timestamp", -1)]
         )
 
         status = "pending"
@@ -771,59 +666,61 @@ async def get_job_status(
                 status = "failure"
                 error_message = latest_log.get("stderr", "Job exited non-zero.")
 
-        logger.debug(f"Status for job {job_key}: {status}")
+        logger.debug(f"Status for job {job_id}: {status}")
         return JobStatus(
-            job_key=job_doc["job_key"],
+            job_id=job_doc["job_id"],
+            name=job_doc.get("name", ""),
+            command=job_doc.get("command", ""),
+            schedule=job_doc.get("schedule", ""),
             last_run=last_run_ts,
             next_run=None,  # Not calculated here
+            telegram_chat_id=job_doc.get("telegram_chat_id"),
             status=status,
-            retry_count=0,  # Placeholder
-            error_message=error_message,
         )
     except HTTPException:
         raise
     except Exception as e:
         logger.error(
-            f"Error getting status for job {job_key}: {e}\n{traceback.format_exc()}"
+            f"Error getting status for job {job_id}: {e}\n{traceback.format_exc()}"
         )
         raise HTTPException(status_code=500, detail="Error retrieving job status.")
 
 
-@app.delete("/jobs/{job_key}", response_model=DeleteJobResponse)
+@app.delete("/jobs/{job_id}", response_model=DeleteJobResponse)
 async def delete_job(
-    job_key: str,
+    job_id: str,
     scheduler: AsyncIOScheduler = Depends(get_scheduler),
     jobs_collection=Depends(get_jobs_collection),
     logs_collection=Depends(get_logs_collection),
 ):
     """Deletes a job from the database and unschedules it."""
-    logger.info(f"Request received to delete job: {job_key}")
+    logger.info(f"Request received to delete job: {job_id}")
 
     # --- Unschedule Operation ---
     try:
-        scheduler.remove_job(job_key)
-        logger.info(f"Successfully unscheduled job: {job_key}")
+        scheduler.remove_job(job_id)
+        logger.info(f"Successfully unscheduled job: {job_id}")
     except Exception:
         logger.warning(
-            f"Job {job_key} not found in scheduler for removal (might have already finished or been removed)."
+            f"Job {job_id} not found in scheduler for removal (might have already finished or been removed)."
         )
         # Continue to attempt DB deletion
 
     # --- Database Deletion ---
     try:
         delete_result = await asyncio.to_thread(
-            jobs_collection.delete_one, {"job_key": job_key}
+            jobs_collection.delete_one, {"job_id": job_id}
         )
 
         if delete_result.deleted_count == 0:
             logger.warning(
-                f"Job config for {job_key} not found in database for deletion."
+                f"Job config for {job_id} not found in database for deletion."
             )
             # If not found in scheduler AND not found in DB, return 404
-            if scheduler.get_job(job_key):
+            if scheduler.get_job(job_id):
                 # If it's still in scheduler but not DB -> inconsistency, maybe 500?
                 logger.error(
-                    f"Inconsistency: Job {job_key} exists in scheduler but not DB."
+                    f"Inconsistency: Job {job_id} exists in scheduler but not DB."
                 )
                 raise HTTPException(
                     status_code=500,
@@ -835,14 +732,14 @@ async def delete_job(
                     status_code=404, detail="Job not found in scheduler or database."
                 )
 
-        logger.info(f"Successfully deleted job config from DB: {job_key}")
+        logger.info(f"Successfully deleted job config from DB: {job_id}")
         return DeleteJobResponse(
-            message="Job unscheduled and deleted successfully", deleted_job_key=job_key
+            message="Job unscheduled and deleted successfully", deleted_job_id=job_id
         )
     except HTTPException:  # Re-raise 404 or 500 from above checks
         raise
     except Exception as e:
-        logger.error(f"Error deleting job {job_key} from database: {e}")
+        logger.error(f"Error deleting job {job_id} from database: {e}")
         raise HTTPException(
             status_code=500, detail="Error deleting job config from database."
         )
@@ -854,6 +751,21 @@ async def root():
     status = "running" if scheduler and scheduler.running else "initializing_or_stopped"
     num_jobs = len(scheduler.get_jobs()) if scheduler else 0
     return {"status": status, "scheduled_jobs_count": num_jobs}
+
+
+@app.on_event("startup")
+async def startup_event():
+    app.state.scheduler.start()
+    app.state.scheduler_app = SchedulerApp()
+    await app.state.scheduler_app.initialize()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if app.state.scheduler:
+        app.state.scheduler.shutdown()
+    if app.state.scheduler_app:
+        await app.state.scheduler_app.stop()
 
 
 # import uvicorn
