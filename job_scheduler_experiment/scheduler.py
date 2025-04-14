@@ -6,9 +6,10 @@ import traceback
 from typing import Optional
 
 from pymongo import MongoClient
-from pymongo.errors import ConnectionError as MongoConnectionError
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+from pymongo.server_api import ServerApi
 from aiogram import Bot
-from aiogram.exceptions import TelegramError
+from aiogram.exceptions import TelegramAPIError
 from loguru import logger
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -43,7 +44,7 @@ def init_telegram_bot(settings: Settings) -> Bot:
     try:
         bot = Bot(token=settings.telegram_bot_token)
         return bot
-    except TelegramError as e:
+    except TelegramAPIError as e:
         logger.error(f"Failed to initialize Telegram bot: {e}")
         raise
 
@@ -52,11 +53,22 @@ def init_mongodb(settings: Settings) -> MongoClient:
     """Initialize MongoDB connection. Retries every 20 minutes if fails."""
     while True:
         try:
-            client = MongoClient(settings.mongodb_uri)
+            # Create a new client and connect to the server
+            client = MongoClient(
+                settings.mongodb_uri,
+                server_api=ServerApi("1"),
+                serverSelectionTimeoutMS=5000,  # 5 seconds timeout
+                connectTimeoutMS=10000,  # 10 seconds connection timeout
+                socketTimeoutMS=45000,  # 45 seconds socket timeout
+            )
+
             # Test the connection
+            # The ismaster command is cheap and does not require auth.
             client.admin.command("ping")
+            logger.info("Successfully connected to MongoDB")
             return client
-        except MongoConnectionError as e:
+
+        except (ConnectionFailure, ServerSelectionTimeoutError) as e:
             logger.error(f"Failed to connect to MongoDB: {e}")
             logger.info("Retrying in 20 minutes...")
             time.sleep(20 * 60)  # 20 minutes
@@ -66,7 +78,7 @@ async def notify_telegram(bot: Bot, chat_id: str, message: str):
     """Send notification to Telegram."""
     try:
         await bot.send_message(chat_id=chat_id, text=message)
-    except TelegramError as e:
+    except TelegramAPIError as e:
         logger.error(f"Failed to send Telegram notification: {e}")
 
 
@@ -80,8 +92,20 @@ def main():
         mongo_client = init_mongodb(settings)
 
         db = mongo_client[settings.mongodb_db_name]
+
+        # Initialize collections with indexes
         jobs_collection = db.jobs
         logs_collection = db.job_logs
+
+        # Create indexes
+        jobs_collection.create_index("last_run_timestamp")
+        jobs_collection.create_index("schedule_period")
+
+        logs_collection.create_index("timestamp")
+        logs_collection.create_index("job_key")
+        logs_collection.create_index("status")
+
+        logger.info("MongoDB collections and indexes initialized")
 
         # TODO: Implement job execution logic
 
