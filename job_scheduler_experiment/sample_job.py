@@ -7,6 +7,10 @@ from loguru import logger
 
 
 def main():
+    env_file = os.getenv("ENV_FILE", ".env")
+    if not load_dotenv(env_file):
+        logger.error(f"Failed to load .env file: {env_file}")
+        return
     # Try importing optional dependencies
     calmlib_import_success = False
     try:
@@ -63,5 +67,4 @@ def main():
 
 
 if __name__ == "__main__":
-    load_dotenv()
     main()

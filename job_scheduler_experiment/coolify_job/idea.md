@@ -1,0 +1,1 @@
+a job that just runs continuously in coolify, sleeping for 24 hours and re-running task
