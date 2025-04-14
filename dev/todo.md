@@ -10,3 +10,9 @@ Idea, what to do for each runner:
   - [ ] Find a way to receive notifications
 - [ ] local docker
 - [ ] local script runner
+
+# TODO
+
+- [x] scheduler is supposed to be running continuously. Checking which jobs are due to run and running them (well, sleep 1 sec or 1 min to avoid overload. Also, make sure jobs don't block each other)
+- [x] scheduler should have fastapi handles for adding new jobs @README.md
+- [x] we need a convenient util that would go to scheduler on a specified port and put the job into scheduler via request
