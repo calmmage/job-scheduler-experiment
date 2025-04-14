@@ -1,39 +1,70 @@
-# Job Scheduler
+# Job Scheduler Experiment
 
-## What we have
+A simple job scheduler that runs Python scripts on a schedule using launchd.
 
-- [x] [setup_plist_job.py](../job_scheduler_experiment/local_plist/setup_plist_job.py): Script to set up launchd job (KeepAlive is now optional via `--keep-alive`).
-- [x] [scheduler.py](../job_scheduler_experiment/scheduler.py):
-  - [x] Runs continuously, checks for due jobs, executes them asynchronously.
-  - [x] Connects to MongoDB for job storage and logging.
-  - [x] Notifies via Telegram on errors.
-  - [x] Includes FastAPI server (`uvicorn`) running on port 8000.
-  - [x] Provides `/add_job` endpoint.
-    - Uses `AddJobRequest` and `AddJobResponse` Pydantic models.
-- [x] [add_job_client.py](../job_scheduler_experiment/add_job_client.py): CLI utility to add jobs via the scheduler's API.
+## Features
+
+- [x] Setup script to create launchd plist
+- [x] Scheduler functionality
+- [x] MongoDB connection
+- [x] Telegram notifications
+- [x] FastAPI server
+- [x] `/add_job` endpoint
+- [x] Job management endpoints (list/status/delete)
+- [x] Job execution history and retry tracking
 
 
-## What is the plan?
+2. Create environment files:
+- `scheduler.env` for scheduler configuration
+- `sample_job.env` for sample job variables
 
-- My Custom Scheduler: [scheduler.py](../job_scheduler_experiment/scheduler.py)
+3. Set up the scheduler as a launchd job:
+```bash
+python setup_plist_job.py --script-path scheduler.py --env-path scheduler.env --keep-alive
+```
 
-- env for the scheduler
+4. Add a sample job:
+```bash
+python add_job_client.py hello_world ./sample_jobs/hello_world.py ./sample_jobs/hello_world.env 3600
+```
 
-## Scheduler features
+## Managing Jobs
 
-- telegram bot connection (from env file)
+Use the `job_manager_client.py` script to manage jobs:
 
-- mongodb connection (from env file)
-  - notify via telegram if not available
+1. List all jobs:
+```bash
+python job_manager_client.py list
+```
 
-## How to set up scheduler first time
+2. Check job status:
+```bash
+python job_manager_client.py status <job_key>
+```
 
-- use setup_plist_job.py to set up the job
-  - `python job_scheduler_experiment/local_plist/setup_plist_job.py path/to/scheduler.py --env-file path/to/.env --keep-alive` (if you want it to restart automatically)
+3. Delete a job:
+```bash
+python job_manager_client.py delete <job_key>
+```
 
-## How to add new jobs to the scheduler
+## API Endpoints
 
-- Option 1: make it uvicorn fastapi app **(Implemented)**
-  - [x] Write a script to add task to the scheduler (same interface: path, env) -> `add_job_client.py`
-  - [ ] Add an alias for easy access
-- Option 2: write directly to the database
+- `GET /` - Check if scheduler is running
+- `GET /jobs` - List all jobs
+- `GET /jobs/{job_key}` - Get status of a specific job
+- `DELETE /jobs/{job_key}` - Delete a job
+- `POST /add_job` - Add a new job
+
+## Monitoring
+
+- Check MongoDB for job execution history
+- Watch Telegram for failure notifications
+- View scheduler logs in the configured log directory
+
+## Future Improvements
+
+- Web interface for job management
+- Job execution timeouts
+- Job dependencies
+- Manual job triggering
+- Job pause/resume functionality

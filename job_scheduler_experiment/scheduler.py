@@ -5,7 +5,7 @@ import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import uvicorn
 from aiogram import Bot
@@ -32,6 +32,24 @@ class AddJobRequest(BaseModel):
 class AddJobResponse(BaseModel):
     message: str
     job_key: str
+
+
+class JobStatus(BaseModel):
+    job_key: str
+    last_run: Optional[datetime]
+    next_run: Optional[datetime]
+    status: str  # "pending", "running", "completed", "failed"
+    retry_count: int
+    error_message: Optional[str]
+
+
+class JobListResponse(BaseModel):
+    jobs: List[JobStatus]
+
+
+class DeleteJobResponse(BaseModel):
+    message: str
+    deleted_job_key: str
 
 
 # --- End FastAPI Models ---
@@ -68,6 +86,9 @@ class JobConfig(BaseModel):
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    # API settings
+    api_port: int = Field(default=18765, env="API_PORT")  # Less obvious default port
 
     # MongoDB settings
     mongodb_uri: str = Field(..., env="MONGODB_URI")
@@ -465,7 +486,12 @@ async def main():
         logger.info("MongoDB indexes ensured.")
 
         # Configure Uvicorn server
-        config = uvicorn.Config(app=app, host="0.0.0.0", port=8000, log_level="info")
+        config = uvicorn.Config(
+            app=app,
+            host="0.0.0.0",
+            port=settings.api_port,  # Use configured port
+            log_level="info",
+        )
         server = uvicorn.Server(config)
 
         # Start the scheduler loop as a background task
@@ -493,6 +519,55 @@ async def main():
         except Exception as notify_err:
             logger.error(f"Failed to send critical error notification: {notify_err}")
         sys.exit(1)
+
+
+@app.get("/")
+async def root():
+    return {"status": "running"}
+
+
+@app.get("/jobs", response_model=JobListResponse)
+async def list_jobs():
+    """List all jobs with their current status."""
+    jobs = []
+    for job_key, job in scheduler.jobs.items():
+        job_status = JobStatus(
+            job_key=job_key,
+            last_run=job.last_run,
+            next_run=job.next_run,
+            status=job.status,
+            retry_count=job.retry_count,
+            error_message=job.error_message,
+        )
+        jobs.append(job_status)
+    return JobListResponse(jobs=jobs)
+
+
+@app.get("/jobs/{job_key}", response_model=JobStatus)
+async def get_job_status(job_key: str):
+    """Get status of a specific job."""
+    if job_key not in scheduler.jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = scheduler.jobs[job_key]
+    return JobStatus(
+        job_key=job_key,
+        last_run=job.last_run,
+        next_run=job.next_run,
+        status=job.status,
+        retry_count=job.retry_count,
+        error_message=job.error_message,
+    )
+
+
+@app.delete("/jobs/{job_key}", response_model=DeleteJobResponse)
+async def delete_job(job_key: str):
+    """Delete a job from the scheduler."""
+    if job_key not in scheduler.jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    scheduler.remove_job(job_key)
+    return DeleteJobResponse(
+        message="Job deleted successfully", deleted_job_key=job_key
+    )
 
 
 if __name__ == "__main__":

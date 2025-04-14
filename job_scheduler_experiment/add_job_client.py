@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 import json
 
+DEFAULT_PORT = 18765  # Match scheduler's default port
+
 
 def add_job(
     scheduler_url: str, job_key: str, executable_path: str, env_path: str, interval: int
@@ -84,11 +86,24 @@ if __name__ == "__main__":
     parser.add_argument("interval", type=int, help="Scheduling interval in seconds.")
     parser.add_argument(
         "--scheduler-url",
-        default="http://localhost:8000",
-        help="URL of the running scheduler API (default: http://localhost:8000).",
+        default=f"http://localhost:{DEFAULT_PORT}",
+        help=f"URL of the running scheduler API (default: http://localhost:{DEFAULT_PORT}).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Port of the running scheduler API (default: {DEFAULT_PORT}).",
     )
 
     args = parser.parse_args()
+
+    # If scheduler-url is default but port is specified, use the specified port
+    if (
+        args.scheduler_url == f"http://localhost:{DEFAULT_PORT}"
+        and args.port != DEFAULT_PORT
+    ):
+        args.scheduler_url = f"http://localhost:{args.port}"
 
     add_job(
         scheduler_url=args.scheduler_url,
