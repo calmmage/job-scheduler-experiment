@@ -36,6 +36,17 @@ def add(
         "-c",
         help="Cron schedule string (e.g., '*/5 * * * *' for every 5 minutes). Provide either --interval or --cron.",
     ),
+    python_executable: Optional[Path] = typer.Option(
+        None,
+        "--python-executable",
+        "-py",
+        help="Optional path to a specific python executable (e.g., from a venv) for this job.",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
     port: int = typer.Option(DEFAULT_PORT, help="Port of the running scheduler API"),
 ):
     """Add a new job to the scheduler using either interval or cron.
@@ -85,6 +96,10 @@ def add(
         payload["schedule_interval_seconds"] = interval  # type: ignore[assignment]
     elif cron is not None:
         payload["cron_schedule"] = cron
+
+    # Add optional python executable path if provided
+    if python_executable is not None:
+        payload["python_executable_path"] = str(python_executable)  # Already resolved
 
     try:
         response = requests.post(add_job_url, json=payload, timeout=10)
@@ -148,13 +163,17 @@ def status(
         response.raise_for_status()
         job = response.json()
 
+        error_line = (
+            f"Last Error: {job['error_message']}" if job["error_message"] else ""
+        )
+
         console.print(
             Panel.fit(
                 f"Status: [magenta]{job['status']}[/magenta]\n"
                 f"Last Run: {job['last_run'] or 'Never'}\n"
                 f"Next Run: {job['next_run'] or 'Not scheduled'}\n"
                 f"Retry Count: {job['retry_count']}\n"
-                f"{f'Last Error: {job['error_message']}' if job['error_message'] else ''}",
+                f"{error_line}",
                 title=f"Job Status: {job_key}",
                 border_style="blue",
             )

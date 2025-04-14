@@ -29,6 +29,7 @@ class AddJobRequest(BaseModel):
     schedule_interval_seconds: Optional[int] = None
     cron_schedule: Optional[str] = None
     job_key: str
+    python_executable_path: Optional[str] = None  # Added field
 
     @model_validator(mode="before")
     @classmethod
@@ -81,6 +82,7 @@ class JobConfig(BaseModel):
     schedule_interval_seconds: Optional[int] = None
     cron_schedule: Optional[str] = None
     job_key: str = Field(...)
+    python_executable_path: Optional[Path] = None  # Added field
 
     @model_validator(mode="before")
     @classmethod
@@ -120,6 +122,20 @@ class JobConfig(BaseModel):
             raise ValueError(
                 f"Environment file path does not exist or is not a file: {v}"
             )
+        return v
+
+    @field_validator("python_executable_path")
+    def python_executable_must_exist(cls, v):
+        if v is not None:
+            if not v.exists() or not v.is_file():
+                raise ValueError(
+                    f"Specified Python executable path does not exist or is not a file: {v}"
+                )
+            # Basic check if it looks like a python executable - could be enhanced
+            if "python" not in v.name.lower():
+                logger.warning(
+                    f"Specified python executable path {v} doesn't obviously look like a Python executable."
+                )
         return v
 
 
@@ -211,18 +227,29 @@ async def run_job(
                         key, value = line.split("=", 1)
                         job_env[key.strip()] = value.strip()
 
-        # Find the python executable within the specified venv
-        python_executable = (
-            job.path_to_env.parent / ".venv/bin/python3"
-        )  # Assuming standard venv structure
-        if not python_executable.exists():
-            python_executable = (
-                job.path_to_env.parent / "bin/python3"
-            )  # Try another common structure
-        if not python_executable.exists():
-            raise FileNotFoundError(
-                f"Python executable not found in expected venv paths near {job.path_to_env}"
+        # Determine the Python executable to use
+        if job.python_executable_path:
+            # Use the path specified in the job config (already validated by Pydantic)
+            python_executable = job.python_executable_path
+            logger.info(f"Using job-specific python executable: {python_executable}")
+        else:
+            # Fall back to STABLE_VENV_PATH
+            stable_venv_path_str = os.environ.get("STABLE_VENV_PATH")
+            if not stable_venv_path_str:
+                raise OSError(
+                    "STABLE_VENV_PATH environment variable is not set and no job-specific python executable provided."
+                )
+
+            stable_venv_path = Path(stable_venv_path_str)
+            python_executable = stable_venv_path / "bin/python3"
+            logger.info(
+                f"Using STABLE_VENV_PATH python executable: {python_executable}"
             )
+
+            if not python_executable.exists() or not python_executable.is_file():
+                raise FileNotFoundError(
+                    f"Python executable not found or is not a file at the specified STABLE_VENV_PATH: {python_executable}"
+                )
 
         process = await asyncio.create_subprocess_exec(
             str(python_executable),
@@ -336,6 +363,10 @@ async def add_job_endpoint(job_request: AddJobRequest):
         job_data = job_request.model_dump()
         job_data["path_to_executable"] = Path(job_data["path_to_executable"]).resolve()
         job_data["path_to_env"] = Path(job_data["path_to_env"]).resolve()
+        if job_data.get("python_executable_path"):
+            job_data["python_executable_path"] = Path(
+                job_data["python_executable_path"]
+            ).resolve()
 
         # Validate using the Pydantic model itself
         job_config = JobConfig(**job_data)
@@ -345,6 +376,8 @@ async def add_job_endpoint(job_request: AddJobRequest):
         # Convert Path objects back to strings for MongoDB
         job_doc["path_to_executable"] = str(job_doc["path_to_executable"])
         job_doc["path_to_env"] = str(job_doc["path_to_env"])
+        if job_doc.get("python_executable_path"):
+            job_doc["python_executable_path"] = str(job_doc["python_executable_path"])
 
         # Insert into MongoDB - this needs to be async
         try:
