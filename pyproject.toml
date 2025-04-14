@@ -24,7 +24,7 @@ pydantic-settings = "^2.8.1"
 typer = "^0.15.2"
 rich = "^14.0.0"
 uvicorn = "^0.34.1"
-aioscheduler = "^1.4.2"
+apscheduler = "^3.10.4"
 
 [tool.poetry.group.extras.dependencies]
 # dependencies for extra features
