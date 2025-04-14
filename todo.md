@@ -1,0 +1,1 @@
+- "support both interval-based and time-of-day/cron-based scheduling in the scheduler" 

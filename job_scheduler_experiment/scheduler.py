@@ -12,7 +12,8 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from fastapi import FastAPI, HTTPException
 from loguru import logger
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from croniter import croniter
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
@@ -25,8 +26,26 @@ from pymongo.server_api import ServerApi
 class AddJobRequest(BaseModel):
     path_to_executable: str
     path_to_env: str
-    schedule_interval_seconds: int
+    schedule_interval_seconds: Optional[int] = None
+    cron_schedule: Optional[str] = None
     job_key: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_schedule_provided(cls, values):
+        interval = values.get("schedule_interval_seconds")
+        cron = values.get("cron_schedule")
+        if (interval is None and cron is None) or (
+            interval is not None and cron is not None
+        ):
+            raise ValueError(
+                "Exactly one of 'schedule_interval_seconds' or 'cron_schedule' must be provided."
+            )
+        if interval is not None and interval <= 0:
+            raise ValueError("'schedule_interval_seconds' must be positive.")
+        if cron is not None and not croniter.is_valid(cron):
+            raise ValueError(f"Invalid cron schedule format: {cron}")
+        return values
 
 
 class AddJobResponse(BaseModel):
@@ -38,8 +57,8 @@ class JobStatus(BaseModel):
     job_key: str
     last_run: Optional[datetime]
     next_run: Optional[datetime]
-    status: str  # "pending", "running", "completed", "failed"
-    retry_count: int
+    status: str  # "pending", "running", "success", "failure" - reflecting log status
+    retry_count: int = 0  # Placeholder - retry logic not implemented
     error_message: Optional[str]
 
 
@@ -59,8 +78,28 @@ class JobConfig(BaseModel):
     path_to_executable: Path
     path_to_env: Path
     last_run_timestamp: Optional[datetime] = None
-    schedule_interval_seconds: int  # Changed from schedule_period: str
-    job_key: str = Field(..., unique=True)
+    schedule_interval_seconds: Optional[int] = None
+    cron_schedule: Optional[str] = None
+    job_key: str = Field(...)
+
+    @model_validator(mode="before")
+    @classmethod
+    def check_schedule_stored(cls, values):
+        interval = values.get("schedule_interval_seconds")
+        cron = values.get("cron_schedule")
+        if interval is None and cron is None:
+            raise ValueError(
+                "Internal error: JobConfig loaded without a schedule type."
+            )
+        if interval is not None and cron is not None:
+            raise ValueError(
+                "Internal error: JobConfig loaded with both schedule types."
+            )
+        if cron is not None and not croniter.is_valid(cron):
+            raise ValueError(
+                f"Internal error: Invalid cron schedule format stored: {cron}"
+            )
+        return values
 
     @field_validator("path_to_executable")
     def executable_must_exist(cls, v):
@@ -88,15 +127,15 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # API settings
-    api_port: int = Field(default=18765, env="API_PORT")  # Less obvious default port
+    api_port: int = Field(default=18765, alias="API_PORT")  # Use alias
 
     # MongoDB settings
-    mongodb_uri: str = Field(..., env="MONGODB_URI")
-    mongodb_db_name: str = Field(..., env="MONGODB_DB_NAME")
+    mongodb_uri: str = Field(..., alias="MONGODB_URI")
+    mongodb_db_name: str = Field(..., alias="MONGODB_DB_NAME")
 
     # Telegram settings
-    telegram_bot_token: str = Field(..., env="TELEGRAM_BOT_TOKEN")
-    telegram_chat_id: str = Field(..., env="TELEGRAM_CHAT_ID")
+    telegram_bot_token: str = Field(..., alias="TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: str = Field(..., alias="TELEGRAM_CHAT_ID")
 
 
 def init_telegram_bot(settings: Settings) -> Bot:
@@ -280,6 +319,7 @@ async def run_job(
 
 app = FastAPI()
 jobs_collection_global = None  # Global variable to hold the collection
+logs_collection_global = None  # Global variable for logs collection
 
 
 @app.post("/add_job", response_model=AddJobResponse)
@@ -400,11 +440,26 @@ async def scheduler_loop(
                             if job.last_run_timestamp.tzinfo is None
                             else job.last_run_timestamp
                         )
-                        if (
-                            last_run + timedelta(seconds=job.schedule_interval_seconds)
-                            <= now
-                        ):
-                            is_due = True
+                        # Check interval
+                        if job.schedule_interval_seconds is not None:
+                            if (
+                                last_run
+                                + timedelta(seconds=job.schedule_interval_seconds)
+                                <= now
+                            ):
+                                is_due = True
+                        # Check cron
+                        elif job.cron_schedule is not None:
+                            # Get the next scheduled time AFTER the last run time
+                            try:
+                                cron = croniter(job.cron_schedule, last_run)
+                                next_scheduled_run = cron.get_next(datetime)
+                                if next_scheduled_run <= now:
+                                    is_due = True
+                            except Exception as e:
+                                logger.error(
+                                    f"Error calculating next cron run check for {job.job_key}: {e}"
+                                )
 
                     if is_due:
                         # Optimistic lock: Try to update last_run_timestamp immediately
@@ -455,10 +510,10 @@ async def scheduler_loop(
 
 
 async def main():
-    global jobs_collection_global
+    global jobs_collection_global, logs_collection_global  # Add logs_collection_global
     try:
         # Load settings
-        settings = Settings()
+        settings = Settings()  # type: ignore
 
         # Initialize connections
         bot = init_telegram_bot(settings)
@@ -470,6 +525,7 @@ async def main():
         jobs_collection = db.jobs
         logs_collection = db.job_logs
         jobs_collection_global = jobs_collection  # Assign to global
+        logs_collection_global = logs_collection  # Assign logs collection to global
 
         # Ensure indexes (Run synchronously before starting async loops)
         # Using .command directly might be better if async driver is not used
@@ -509,8 +565,9 @@ async def main():
     except Exception as e:
         logger.error(f"Critical error in main loop: {e}\n{traceback.format_exc()}")
         # Try to notify Telegram before exiting (best effort)
+        # Linter might complain here if env vars aren't set, which is expected.
         try:
-            settings = Settings()  # Reload settings in case they weren't loaded
+            settings = Settings()  # type: ignore
             bot = init_telegram_bot(settings)
             await notify_telegram(
                 bot, settings.telegram_chat_id, f"Scheduler CRASHED: {e}"
@@ -529,57 +586,257 @@ async def root():
 @app.get("/jobs", response_model=JobListResponse)
 async def list_jobs():
     """List all jobs with their current status."""
+    if (
+        jobs_collection_global is None or logs_collection_global is None
+    ):  # Check both collections
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
     jobs = []
-    for job_key, job in scheduler.jobs.items():
-        job_status = JobStatus(
-            job_key=job_key,
-            last_run=job.last_run,
-            next_run=job.next_run,
-            status=job.status,
-            retry_count=job.retry_count,
-            error_message=job.error_message,
-        )
-        jobs.append(job_status)
-    return JobListResponse(jobs=jobs)
+    try:
+        # Get all job configs
+        job_docs_cursor = await asyncio.to_thread(jobs_collection_global.find, {})
+        job_configs = await asyncio.to_thread(list, job_docs_cursor)
+
+        # For each job, get the latest log status
+        for job_doc in job_configs:
+            job_key = job_doc["job_key"]
+            last_run_ts = job_doc.get("last_run_timestamp")
+            interval = job_doc.get("schedule_interval_seconds")
+
+            # Find the most recent log entry for this job
+            latest_log_cursor = await asyncio.to_thread(
+                logs_collection_global.find, {"job_key": job_key}
+            )
+            # Sort by timestamp descending and get the first one
+            latest_log_list = await asyncio.to_thread(
+                lambda: list(latest_log_cursor.sort("timestamp", -1).limit(1))
+            )
+            latest_log = latest_log_list[0] if latest_log_list else None
+
+            status = "pending"  # Default if no logs found
+            error_message = None
+            if latest_log:
+                status = latest_log.get("status", "unknown")  # Use log status
+                # Use stderr as error message if status is failure
+                if status == "failure":
+                    error_message = latest_log.get("stderr")
+                elif (
+                    latest_log.get("return_code") is not None
+                    and latest_log.get("return_code") != 0
+                ):
+                    # Catch cases where status might be 'running' but process exited non-zero (e.g. crash during run)
+                    status = "failure"
+                    error_message = latest_log.get(
+                        "stderr",
+                        "Job exited with non-zero code but no stderr captured.",
+                    )
+
+            # Calculate next run time
+            next_run = None
+            if last_run_ts and interval:
+                last_run_aware = (
+                    last_run_ts.replace(tzinfo=timezone.utc)
+                    if last_run_ts.tzinfo is None
+                    else last_run_ts
+                )
+                if interval is not None:
+                    next_run = last_run_aware + timedelta(seconds=interval)
+            elif interval and not last_run_ts:
+                # First run logic for interval: leave as None in status? Or calculate from now?
+                # Let's leave as None for status display consistency.
+                pass
+            elif last_run_ts and job_doc.get("cron_schedule"):
+                last_run_aware = (
+                    last_run_ts.replace(tzinfo=timezone.utc)
+                    if last_run_ts.tzinfo is None
+                    else last_run_ts
+                )
+                try:
+                    cron_sched = job_doc["cron_schedule"]
+                    # Need a base time for croniter
+                    cron = croniter(cron_sched, last_run_aware)
+                    next_run = cron.get_next(datetime)
+                except Exception as e:
+                    logger.error(
+                        f"Error calculating next cron run for {job_key} in list: {e}"
+                    )
+            elif interval and not last_run_ts:
+                # First run logic for interval: leave as None in status? Or calculate from now?
+                # Let's leave as None for status display consistency.
+                pass
+            elif job_doc.get("cron_schedule") and not last_run_ts:
+                try:
+                    # First run for cron based on 'now'
+                    now_local = datetime.now(timezone.utc)  # Use current time
+                    cron_sched = job_doc["cron_schedule"]
+                    cron = croniter(cron_sched, now_local)
+                    next_run = cron.get_next(datetime)
+                except Exception as e:
+                    logger.error(
+                        f"Error calculating first cron run for {job_key} in list: {e}"
+                    )
+
+            job_status = JobStatus(
+                job_key=job_key,
+                last_run=last_run_ts,
+                next_run=next_run,
+                status=status,
+                retry_count=0,  # Hardcoded for now
+                error_message=error_message,
+            )
+            jobs.append(job_status)
+        return JobListResponse(jobs=jobs)
+    except Exception as e:
+        logger.error(f"Error listing jobs: {e}\\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Error retrieving job list.")
 
 
 @app.get("/jobs/{job_key}", response_model=JobStatus)
 async def get_job_status(job_key: str):
     """Get status of a specific job."""
-    if job_key not in scheduler.jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job = scheduler.jobs[job_key]
-    return JobStatus(
-        job_key=job_key,
-        last_run=job.last_run,
-        next_run=job.next_run,
-        status=job.status,
-        retry_count=job.retry_count,
-        error_message=job.error_message,
-    )
+    if jobs_collection_global is None or logs_collection_global is None:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    try:
+        # Get job config
+        job_doc = await asyncio.to_thread(
+            jobs_collection_global.find_one, {"job_key": job_key}
+        )
+
+        if not job_doc:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        # Find the most recent log entry for this job
+        latest_log_cursor = await asyncio.to_thread(
+            logs_collection_global.find, {"job_key": job_key}
+        )
+        latest_log_list = await asyncio.to_thread(
+            lambda: list(latest_log_cursor.sort("timestamp", -1).limit(1))
+        )
+        latest_log = latest_log_list[0] if latest_log_list else None
+
+        status = "pending"  # Default if no logs found
+        error_message = None
+        if latest_log:
+            status = latest_log.get("status", "unknown")
+            if status == "failure":
+                error_message = latest_log.get("stderr")
+            elif (
+                latest_log.get("return_code") is not None
+                and latest_log.get("return_code") != 0
+            ):
+                status = "failure"
+                error_message = latest_log.get(
+                    "stderr", "Job exited with non-zero code but no stderr captured."
+                )
+
+        # Calculate next run time
+        next_run = None
+        last_run_ts = job_doc.get("last_run_timestamp")
+        interval = job_doc.get("schedule_interval_seconds")
+        if last_run_ts and interval:
+            last_run_aware = (
+                last_run_ts.replace(tzinfo=timezone.utc)
+                if last_run_ts.tzinfo is None
+                else last_run_ts
+            )
+            if interval is not None:
+                next_run = last_run_aware + timedelta(seconds=interval)
+        elif last_run_ts and job_doc.get("cron_schedule"):
+            last_run_aware = (
+                last_run_ts.replace(tzinfo=timezone.utc)
+                if last_run_ts.tzinfo is None
+                else last_run_ts
+            )
+            try:
+                cron_sched = job_doc["cron_schedule"]
+                cron = croniter(cron_sched, last_run_aware)
+                next_run = cron.get_next(datetime)
+            except Exception as e:
+                logger.error(
+                    f"Error calculating next cron run for {job_key} in status: {e}"
+                )
+        elif interval and not last_run_ts:
+            # First run logic for interval: leave as None in status? Or calculate from now?
+            # Let's leave as None for status display consistency.
+            pass
+        elif job_doc.get("cron_schedule") and not last_run_ts:
+            try:
+                # First run for cron based on 'now'
+                now_local = datetime.now(timezone.utc)  # Use current time
+                cron_sched = job_doc["cron_schedule"]
+                cron = croniter(cron_sched, now_local)
+                next_run = cron.get_next(datetime)
+            except Exception as e:
+                logger.error(
+                    f"Error calculating first cron run for {job_key} in status: {e}"
+                )
+
+        return JobStatus(
+            job_key=job_doc["job_key"],
+            last_run=last_run_ts,
+            next_run=next_run,
+            status=status,
+            retry_count=0,  # Hardcoded
+            error_message=error_message,
+        )
+    except HTTPException:  # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(
+            f"Error getting status for job {job_key}: {e}\\n{traceback.format_exc()}"
+        )
+        raise HTTPException(status_code=500, detail="Error retrieving job status.")
 
 
 @app.delete("/jobs/{job_key}", response_model=DeleteJobResponse)
 async def delete_job(job_key: str):
     """Delete a job from the scheduler."""
-    if job_key not in scheduler.jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    scheduler.remove_job(job_key)
-    return DeleteJobResponse(
-        message="Job deleted successfully", deleted_job_key=job_key
-    )
+    if jobs_collection_global is None:
+        raise HTTPException(status_code=503, detail="Database unavailable.")
+
+    try:
+        # Use asyncio.to_thread for the blocking delete_one operation
+        delete_result = await asyncio.to_thread(
+            jobs_collection_global.delete_one, {"job_key": job_key}
+        )
+
+        if delete_result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        logger.info(f"Deleted job: {job_key}")
+        return DeleteJobResponse(
+            message="Job deleted successfully", deleted_job_key=job_key
+        )
+    except HTTPException:  # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting job {job_key}: {e}")
+        raise HTTPException(status_code=500, detail="Error deleting job.")
 
 
 if __name__ == "__main__":
     # Ensure graceful shutdown on SIGINT/SIGTERM
     loop = asyncio.get_event_loop()
+    # Initialize settings once here to potentially catch config errors early
+    # Linter might complain if env vars aren't set, which is expected.
     try:
-        # Start the main async function
-        # asyncio.run(main()) handles loop creation and closing
-        asyncio.run(main())
+        settings = Settings()  # type: ignore
+    except Exception as config_e:
+        logger.critical(f"Failed to load settings: {config_e}")
+        sys.exit(1)
+
+    try:
+        # Pass settings to main to avoid global state issues if possible
+        # Note: Current main() uses globals, refactoring needed for pure DI
+        asyncio.run(main())  # main() still reads settings internally
     except KeyboardInterrupt:
         logger.info("Scheduler stopped by user.")
+    except Exception as main_e:
+        logger.critical(
+            f"Unhandled exception in main execution: {main_e}\n{traceback.format_exc()}"
+        )
+        sys.exit(1)
     finally:
-        # Cleanup tasks etc. if needed
-        # loop.run_until_complete(loop.shutdown_asyncgens()) # Optional cleanup
-        logger.info("Scheduler shut down gracefully.")
+        logger.info("Scheduler attempting graceful shutdown.")
+        # Add any explicit cleanup needed here

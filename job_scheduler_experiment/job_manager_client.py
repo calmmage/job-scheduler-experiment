@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-import argparse
+import typer
 import requests
-import sys
+from pathlib import Path
 from typing import Optional
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
 
+app = typer.Typer(help="Job Scheduler CLI - Manage and monitor scheduled jobs")
+console = Console()
 DEFAULT_PORT = 18765
 
 
@@ -12,104 +17,172 @@ def get_scheduler_url(port: Optional[int] = None) -> str:
     return f"http://localhost:{port or DEFAULT_PORT}"
 
 
-def list_jobs(scheduler_url: str):
+@app.command()
+def add(
+    job_key: str = typer.Argument(..., help="Unique key/identifier for the job"),
+    executable_path: Path = typer.Argument(
+        ..., help="Path to the Python script to execute"
+    ),
+    env_path: Path = typer.Argument(..., help="Path to the .env file for the job"),
+    interval: Optional[int] = typer.Option(
+        None,
+        "--interval",
+        "-i",
+        help="Scheduling interval in seconds (e.g., 300 for 5 minutes). Provide either --interval or --cron.",
+    ),
+    cron: Optional[str] = typer.Option(
+        None,
+        "--cron",
+        "-c",
+        help="Cron schedule string (e.g., '*/5 * * * *' for every 5 minutes). Provide either --interval or --cron.",
+    ),
+    port: int = typer.Option(DEFAULT_PORT, help="Port of the running scheduler API"),
+):
+    """Add a new job to the scheduler using either interval or cron.
+
+    Examples:
+        job-manager-client add my-job script.py .env --interval 60
+        job-manager-client add another-job task.py .env --cron "0 2 * * *"
+    """
+    scheduler_url = get_scheduler_url(port)
+    add_job_url = f"{scheduler_url}/add_job"
+
+    # Validate that exactly one schedule type is provided
+    if (interval is None and cron is None) or (
+        interval is not None and cron is not None
+    ):
+        console.print(
+            "[red]Error: You must provide exactly one of --interval or --cron.[/red]"
+        )
+        raise typer.Exit(1)
+
+    if interval is not None and interval <= 0:
+        console.print("[red]Error: --interval must be a positive integer.[/red]")
+        raise typer.Exit(1)
+
+    # Basic cron validation (server does more thorough check)
+    if cron is not None and len(cron.split()) != 5:
+        console.print(
+            "[red]Warning: Cron string doesn't seem to have 5 parts. Server will perform full validation.[/red]"
+        )
+        # Let the server handle full cron validation
+
+    try:
+        # Resolve paths to absolute paths before sending
+        abs_executable_path = str(executable_path.resolve())
+        abs_env_path = str(env_path.resolve())
+    except Exception as e:
+        console.print(f"[red]Error resolving paths: {e}[/red]")
+        raise typer.Exit(1)
+
+    payload = {
+        "job_key": job_key,
+        "path_to_executable": abs_executable_path,
+        "path_to_env": abs_env_path,
+    }
+    # Add the chosen schedule type to the payload
+    if interval is not None:
+        payload["schedule_interval_seconds"] = interval  # type: ignore[assignment]
+    elif cron is not None:
+        payload["cron_schedule"] = cron
+
+    try:
+        response = requests.post(add_job_url, json=payload, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        console.print(f"[green]Success: {result['message']}[/green]")
+    except requests.exceptions.RequestException as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
+
+
+@app.command()
+def list(
+    port: int = typer.Option(DEFAULT_PORT, help="Port of the running scheduler API"),
+):
     """List all jobs in the scheduler."""
+    scheduler_url = get_scheduler_url(port)
+
     try:
         response = requests.get(f"{scheduler_url}/jobs", timeout=10)
         response.raise_for_status()
         jobs = response.json()["jobs"]
 
         if not jobs:
-            print("No jobs found in the scheduler.")
+            console.print("[yellow]No jobs found in the scheduler.[/yellow]")
             return
 
-        print("\nCurrent Jobs:")
-        print("-" * 80)
+        table = Table(title="Current Jobs")
+        table.add_column("Job Key", style="cyan")
+        table.add_column("Status", style="magenta")
+        table.add_column("Last Run")
+        table.add_column("Next Run")
+        table.add_column("Retries", justify="right")
+
         for job in jobs:
-            print(f"Job Key: {job['job_key']}")
-            print(f"Status: {job['status']}")
-            print(f"Last Run: {job['last_run'] or 'Never'}")
-            print(f"Next Run: {job['next_run'] or 'Not scheduled'}")
-            print(f"Retry Count: {job['retry_count']}")
-            if job["error_message"]:
-                print(f"Last Error: {job['error_message']}")
-            print("-" * 80)
+            table.add_row(
+                job["job_key"],
+                job["status"],
+                job["last_run"] or "Never",
+                job["next_run"] or "Not scheduled",
+                str(job["retry_count"]),
+            )
+
+        console.print(table)
 
     except requests.exceptions.RequestException as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
 
 
-def get_job_status(scheduler_url: str, job_key: str):
+@app.command()
+def status(
+    job_key: str = typer.Argument(..., help="Job key to check status for"),
+    port: int = typer.Option(DEFAULT_PORT, help="Port of the running scheduler API"),
+):
     """Get status of a specific job."""
+    scheduler_url = get_scheduler_url(port)
+
     try:
         response = requests.get(f"{scheduler_url}/jobs/{job_key}", timeout=10)
         response.raise_for_status()
         job = response.json()
 
-        print(f"\nJob Status for '{job_key}':")
-        print("-" * 80)
-        print(f"Status: {job['status']}")
-        print(f"Last Run: {job['last_run'] or 'Never'}")
-        print(f"Next Run: {job['next_run'] or 'Not scheduled'}")
-        print(f"Retry Count: {job['retry_count']}")
-        if job["error_message"]:
-            print(f"Last Error: {job['error_message']}")
-        print("-" * 80)
+        console.print(
+            Panel.fit(
+                f"Status: [magenta]{job['status']}[/magenta]\n"
+                f"Last Run: {job['last_run'] or 'Never'}\n"
+                f"Next Run: {job['next_run'] or 'Not scheduled'}\n"
+                f"Retry Count: {job['retry_count']}\n"
+                f"{f'Last Error: {job['error_message']}' if job['error_message'] else ''}",
+                title=f"Job Status: {job_key}",
+                border_style="blue",
+            )
+        )
 
     except requests.exceptions.RequestException as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
 
 
-def delete_job(scheduler_url: str, job_key: str):
+@app.command()
+def delete(
+    job_key: str = typer.Argument(..., help="Job key to delete"),
+    port: int = typer.Option(DEFAULT_PORT, help="Port of the running scheduler API"),
+):
     """Delete a job from the scheduler."""
+    scheduler_url = get_scheduler_url(port)
+
     try:
         response = requests.delete(f"{scheduler_url}/jobs/{job_key}", timeout=10)
         response.raise_for_status()
         result = response.json()
-        print(f"Success: {result['message']}")
+        console.print(f"[green]Success: {result['message']}[/green]")
 
     except requests.exceptions.RequestException as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Manage jobs in the scheduler.")
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
-
-    # Common arguments
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_PORT,
-        help=f"Port of the running scheduler API (default: {DEFAULT_PORT}).",
-    )
-
-    # List jobs command
-    list_parser = subparsers.add_parser("list", help="List all jobs")
-
-    # Get job status command
-    status_parser = subparsers.add_parser("status", help="Get status of a specific job")
-    status_parser.add_argument("job_key", help="Job key to check status for")
-
-    # Delete job command
-    delete_parser = subparsers.add_parser("delete", help="Delete a job")
-    delete_parser.add_argument("job_key", help="Job key to delete")
-
-    args = parser.parse_args()
-    scheduler_url = get_scheduler_url(args.port)
-
-    if args.command == "list":
-        list_jobs(scheduler_url)
-    elif args.command == "status":
-        get_job_status(scheduler_url, args.job_key)
-    elif args.command == "delete":
-        delete_job(scheduler_url, args.job_key)
-    else:
-        parser.print_help()
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    app()

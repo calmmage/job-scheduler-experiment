@@ -10,7 +10,7 @@ def setup_plist_job(script_path, env_file=None, hour=12, minute=0, keep_alive=Fa
         raise ValueError("Script must be a valid .py file")
 
     job_name = f"com.job_scheduler_experiment.{script_path.stem}"
-    venv_python = os.path.join(os.getenv("CALMMAGE_DEV_ENV_PATH"), ".venv/bin/python3")
+    venv_python = os.path.join(os.getenv("DEV_ENV_PATH"), "bin/python3")
     if not os.path.exists(venv_python):
         raise ValueError(f"Virtual environment not found at {venv_python}")
 

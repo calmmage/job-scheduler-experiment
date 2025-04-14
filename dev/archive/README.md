@@ -13,6 +13,14 @@ A simple job scheduler that runs Python scripts on a schedule using launchd.
 - [x] Job management endpoints (list/status/delete)
 - [x] Job execution history and retry tracking
 
+## Setup
+
+1. Create a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
 2. Create environment files:
 - `scheduler.env` for scheduler configuration
@@ -25,7 +33,7 @@ python setup_plist_job.py --script-path scheduler.py --env-path scheduler.env --
 
 4. Add a sample job:
 ```bash
-python add_job_client.py hello_world ./sample_jobs/hello_world.py ./sample_jobs/hello_world.env 3600
+python job_manager_client.py add hello_world ./sample_jobs/hello_world.py ./sample_jobs/hello_world.env 3600
 ```
 
 ## Managing Jobs
@@ -46,6 +54,13 @@ python job_manager_client.py status <job_key>
 ```bash
 python job_manager_client.py delete <job_key>
 ```
+
+4. Add a new job:
+```bash
+python job_manager_client.py add <job_key> <executable_path> <env_path> <interval_seconds>
+```
+
+All commands support a `--port` option to specify a different scheduler port (default: 18765).
 
 ## API Endpoints
 
