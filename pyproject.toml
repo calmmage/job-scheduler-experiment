@@ -1,9 +1,13 @@
 [tool.poetry]
-name = "project-name"
+name = "job-scheduler-experiment"
 version = "0.0.1"
 description = ""
 authors = ["Petr Lavrov <calmmage@gmail.com>"]
 readme = "README.md"
+packages=[
+    { include = "job_scheduler_experiment", from = "." },
+]
+
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
@@ -73,6 +77,15 @@ python-dotenv = "*"
 [tool.poetry.group.test.dependencies]
 pytest = ">=6"
 #pytest-mongodb = "*"
+black = {extras = ["jupyter"], version = "^25.1.0"}
+isort = "^6.0.1"
+vulture = "^2.14"
+pytest-cov = "^6.1.1"
+pytest-asyncio = "^0.26.0"
+pytest-mock = "^3.14.0"
+pyupgrade = "^3.19.1"
+pyright = "^1.1.399"
+ruff = "^0.11.5"
 
 [tool.poetry.group.docs.dependencies]
 #mkdocs = ">=1.6"
